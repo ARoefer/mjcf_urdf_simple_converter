@@ -1,10 +1,13 @@
 import mujoco
+import mujoco._structs
 import numpy
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 from scipy.spatial.transform import Rotation
 import numpy as np
+from pathlib import Path
 from stl import mesh
+from typing import Union
 import os
 
 def array2str(arr):
@@ -54,70 +57,62 @@ def create_joint(xml_root, name, parent, child, pos, rpy, axis=None, jnt_range=N
     return jnt_element
 
 
-def convert(mjcf_file, urdf_file, asset_file_prefix=""):
-    """
-    load MJCF file, parse it in mujoco and save it as URDF
-    replicate just the kinematic structure, ignore most dynamics, actuators, etc.
-    only works with mesh geoms
-    https://mujoco.readthedocs.io/en/stable/APIreference.html#mjmodel
-    http://wiki.ros.org/urdf/XML
-    
-    :param mjcf_file: path to existing MJCF file which will be loaded
-    :param urdf_file: path to URDF file which will be saved
-    :param asset_file_prefix: prefix to add to the stl file names (e.g. package://my_package/meshes/)
-    """
-    assert mjcf_file.endswith(".xml"), f"{mjcf_file=} should end with .xml"
-    assert urdf_file.endswith(".urdf"), f"{urdf_file=} should end with .urdf"
-    output_dir = os.path.dirname(urdf_file)
-    assert os.path.exists(output_dir), f"{output_dir=} does not exist, please create it first"
-    model = mujoco.MjModel.from_xml_path(mjcf_file)
-    root = ET.Element('robot', {'name': "converted_robot"})
-    root.append(ET.Comment('generated with mjcf_urdf_simple_converter (https://github.com/Yasu31/mjcf_urdf_simple_converter)'))
-
-    for id in range(model.nbody):
+def convert_subtree(root : ET.Element, model : mujoco.MjModel, id_or_name : Union[str, int],
+                    output_dir : Path=None, asset_file_prefix : str="") -> ET.Element:
+    # Convenience: Identify a root body either by its name or by the id
+    if isinstance(id_or_name, int):
         child_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, id)
-        parent_id = model.body_parentid[id]
-        parent_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent_id)
+        id = id_or_name
+    else:
+        if isinstance(model, mujoco._structs.MjModel):
+            id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, str(id_or_name))
+        else:
+            id = model.body_name2id(id_or_name)
+        child_name = id_or_name
 
-        # URDFs assume that the link origin is at the joint position, while in MJCF they can have user-defined values
-        # this requires some conversion for the visual, inertial, and joint elements...
-        # this is done by creating a dummy body with negligible mass and inertia at the joint position.
-        parentbody2childbody_pos = model.body_pos[id]
-        parentbody2childbody_quat = model.body_quat[id]  # [w, x, y, z]
+    parent_id = model.body_parentid[id]
+    parent_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent_id) if isinstance(model, mujoco._structs.MjModel) else model.body_id2name(parent_id)
+
+    # URDFs assume that the link origin is at the joint position, while in MJCF they can have user-defined values
+    # this requires some conversion for the visual, inertial, and joint elements...
+    # this is done by creating a dummy body with negligible mass and inertia at the joint position.
+    parentbody2childbody_pos = model.body_pos[id]
+    parentbody2childbody_quat = model.body_quat[id]  # [w, x, y, z]
+    # change to [x, y, z, w]
+    parentbody2childbody_quat = [parentbody2childbody_quat[1], parentbody2childbody_quat[2], parentbody2childbody_quat[3], parentbody2childbody_quat[0]]
+    parentbody2childbody_Rot = Rotation.from_quat(parentbody2childbody_quat).as_matrix()
+    parentbody2childbody_rpy = Rotation.from_matrix(parentbody2childbody_Rot).as_euler('xyz')
+
+    # read inertial info
+    mass = model.body_mass[id]
+    inertia = model.body_inertia[id]
+    childbody2childinertia_pos = model.body_ipos[id]
+    childbody2childinertia_quat = model.body_iquat[id]  # [w, x, y, z]
+    # change to [x, y, z, w]
+    childbody2childinertia_quat = [childbody2childinertia_quat[1], childbody2childinertia_quat[2], childbody2childinertia_quat[3], childbody2childinertia_quat[0]]
+    childbody2childinertia_Rot = Rotation.from_quat(childbody2childinertia_quat).as_matrix()
+    childbody2childinertia_rpy = Rotation.from_matrix(childbody2childinertia_Rot).as_euler('xyz')
+
+    # create child body
+    body_element = create_body(root, child_name, childbody2childinertia_pos, childbody2childinertia_rpy, mass, inertia[0], inertia[1], inertia[2])
+
+    # read geom info and add it child body
+    geomnum = model.body_geomnum[id]
+    for geomnum_i in range(geomnum):
+        geomid = model.body_geomadr[id] + geomnum_i
+        if model.geom_type[geomid] != mujoco.mjtGeom.mjGEOM_MESH:
+            # only support mesh geoms
+            continue
+        geom_dataid = model.geom_dataid[geomid]  # id of geom's mesh
+        geom_pos = model.geom_pos[geomid]
+        geom_quat = model.geom_quat[geomid]  # [w, x, y, z]
         # change to [x, y, z, w]
-        parentbody2childbody_quat = [parentbody2childbody_quat[1], parentbody2childbody_quat[2], parentbody2childbody_quat[3], parentbody2childbody_quat[0]]
-        parentbody2childbody_Rot = Rotation.from_quat(parentbody2childbody_quat).as_matrix()
-        parentbody2childbody_rpy = Rotation.from_matrix(parentbody2childbody_Rot).as_euler('xyz')
+        geom_quat = [geom_quat[1], geom_quat[2], geom_quat[3], geom_quat[0]]
+        geom_rpy = Rotation.from_quat(geom_quat).as_euler('xyz')
+        mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, geom_dataid) if isinstance(model, mujoco._structs.MjModel) else model.geom_id2name(geom_dataid)
 
-        # read inertial info
-        mass = model.body_mass[id]
-        inertia = model.body_inertia[id]
-        childbody2childinertia_pos = model.body_ipos[id]
-        childbody2childinertia_quat = model.body_iquat[id]  # [w, x, y, z]
-        # change to [x, y, z, w]
-        childbody2childinertia_quat = [childbody2childinertia_quat[1], childbody2childinertia_quat[2], childbody2childinertia_quat[3], childbody2childinertia_quat[0]]
-        childbody2childinertia_Rot = Rotation.from_quat(childbody2childinertia_quat).as_matrix()
-        childbody2childinertia_rpy = Rotation.from_matrix(childbody2childinertia_Rot).as_euler('xyz')
-
-        # create child body
-        body_element = create_body(root, child_name, childbody2childinertia_pos, childbody2childinertia_rpy, mass, inertia[0], inertia[1], inertia[2])
-
-        # read geom info and add it child body
-        geomnum = model.body_geomnum[id]
-        for geomnum_i in range(geomnum):
-            geomid = model.body_geomadr[id] + geomnum_i
-            if model.geom_type[geomid] != mujoco.mjtGeom.mjGEOM_MESH:
-                # only support mesh geoms
-                continue
-            geom_dataid = model.geom_dataid[geomid]  # id of geom's mesh
-            geom_pos = model.geom_pos[geomid]
-            geom_quat = model.geom_quat[geomid]  # [w, x, y, z]
-            # change to [x, y, z, w]
-            geom_quat = [geom_quat[1], geom_quat[2], geom_quat[3], geom_quat[0]]
-            geom_rpy = Rotation.from_quat(geom_quat).as_euler('xyz')
-            mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, geom_dataid)
-
-            # create visual element within body element
+        # create visual element within body element
+        if output_dir is not None:
             visual_element = ET.SubElement(body_element, 'visual', {'name': mesh_name})
             origin_element = ET.SubElement(visual_element, 'origin', {'xyz': array2str(geom_pos), 'rpy': array2str(geom_rpy)})
             geometry_element = ET.SubElement(visual_element, 'geometry')
@@ -139,92 +134,131 @@ def convert(mjcf_file, urdf_file, asset_file_prefix=""):
             for i in range(facenum):
                 data['vectors'][i] = vert[face[i]]
             m = mesh.Mesh(data, remove_empty_areas=False)
-            mesh_save_path = os.path.join(output_dir, f"converted_{mesh_name}.stl")
-            m.save(mesh_save_path)
+            mesh_save_path = output_dir / f"converted_{mesh_name}.stl"
+            m.save(str(mesh_save_path))
 
+    jntnum = model.body_jntnum[id]
 
-        jntnum = model.body_jntnum[id]
+    if child_name == "world":
+        # there is no joint connecting the world to anything, since it is the root
+        assert parent_name == "world"
+        assert jntnum == 0
+        return  # skip adding joint element or parent body
 
-        if child_name == "world":
-            # there is no joint connecting the world to anything, since it is the root
-            assert parent_name == "world"
-            assert jntnum == 0
-            continue  # skip adding joint element or parent body
-
+    if jntnum == 0:
+        # No joints, create a fixed joint directly to parent
+        jnt_name = f"{parent_name}2{child_name}_fixed"
+        parentbody2jnt_pos = parentbody2childbody_pos
+        parentbody2jnt_rpy = parentbody2childbody_rpy
+        create_joint(root, jnt_name, parent_name, child_name, parentbody2jnt_pos, parentbody2jnt_rpy)
+    else:
+        # For bodies with joints, create a chain of dummy bodies for each joint
+        current_parent = parent_name
+        cumulative_pos = np.zeros(3)  # position of the current joint in the child body frame
+        cumulative_rot = np.eye(3)
         
-        if jntnum == 0:
-            # No joints, create a fixed joint directly to parent
-            jnt_name = f"{parent_name}2{child_name}_fixed"
-            parentbody2jnt_pos = parentbody2childbody_pos
-            parentbody2jnt_rpy = parentbody2childbody_rpy
-            create_joint(root, jnt_name, parent_name, child_name, parentbody2jnt_pos, parentbody2jnt_rpy)
-        else:
-            # For bodies with joints, create a chain of dummy bodies for each joint
-            current_parent = parent_name
-            cumulative_pos = np.zeros(3)  # position of the current joint in the child body frame
-            cumulative_rot = np.eye(3)
+        # Process all joints for this body
+        for j in range(jntnum):
+            jntid = model.body_jntadr[id] + j
+            jnt_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jntid) if isinstance(model, mujoco._structs.MjModel) else model.joint_id2name(jntid)
+            if jnt_name is None:
+                # Generate a random name for the joint
+                jnt_name = f"joint_{jntid}"
+                print(f"WARNING: joint name for {jntid} is None (could happen for ball joints with >1DoF), using automatically generated name {jnt_name}")
+            jnt_body_name = f"{jnt_name}_jointbody"
             
-            # Process all joints for this body
-            for j in range(jntnum):
-                jntid = model.body_jntadr[id] + j
-                jnt_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jntid)
-                if jnt_name is None:
-                    # Generate a random name for the joint
-                    jnt_name = f"joint_{jntid}"
-                    print(f"WARNING: joint name for {jntid} is None (could happen for ball joints with >1DoF), using automatically generated name {jnt_name}")
-                jnt_body_name = f"{jnt_name}_jointbody"
+            # Create dummy body for this joint
+            create_dummy_body(root, jnt_body_name)
+            
+            if model.jnt_type[jntid] == mujoco.mjtJoint.mjJNT_HINGE:
+                # Revolute joint
+                jnt_range = model.jnt_range[jntid]  # [min, max]
+                jnt_axis_childbody = model.jnt_axis[jntid]  # [x, y, z]
+                childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
                 
-                # Create dummy body for this joint
-                create_dummy_body(root, jnt_body_name)
-                
-                if model.jnt_type[jntid] == mujoco.mjtJoint.mjJNT_HINGE:
-                    # Revolute joint
-                    jnt_range = model.jnt_range[jntid]  # [min, max]
-                    jnt_axis_childbody = model.jnt_axis[jntid]  # [x, y, z]
-                    childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
-                    
-                    # Calculate joint position in parent body frame
-                    if j == 0:
-                        # First joint connects to original parent
-                        parentbody2jnt_pos = parentbody2childbody_pos + parentbody2childbody_Rot @ childbody2jnt_pos
-                        parentbody2jnt_rpy = parentbody2childbody_rpy
-                        parentbody2jnt_axis = jnt_axis_childbody  # In child body frame
-                    else:
-                        # Subsequent joints connect to previous dummy body
-                        # Position is relative to original child body position
-                        parentbody2jnt_pos = childbody2jnt_pos - cumulative_pos
-                        parentbody2jnt_rpy = np.zeros(3)
-                        parentbody2jnt_axis = jnt_axis_childbody
-                    
-                    # Connect current parent to this joint body
-                    create_joint(root, jnt_name, current_parent, jnt_body_name, 
-                                parentbody2jnt_pos, parentbody2jnt_rpy, 
-                                parentbody2jnt_axis, jnt_range)
-                    
+                # Calculate joint position in parent body frame
+                if j == 0:
+                    # First joint connects to original parent
+                    parentbody2jnt_pos = parentbody2childbody_pos + parentbody2childbody_Rot @ childbody2jnt_pos
+                    parentbody2jnt_rpy = parentbody2childbody_rpy
+                    parentbody2jnt_axis = jnt_axis_childbody  # In child body frame
                 else:
-                    # Handle other joint types (as fixed joints for now)
-                    print(f"doesn't support joint type {model.jnt_type[jntid]}, treating as fixed joint...")
-                    childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
-                    if j == 0:
-                        parentbody2jnt_pos = parentbody2childbody_pos
-                        parentbody2jnt_rpy = parentbody2childbody_rpy
-                    else:
-                        parentbody2jnt_pos = np.zeros(3)
-                        parentbody2jnt_rpy = np.zeros(3)
-                    
-                    create_joint(root, jnt_name, current_parent, jnt_body_name,
-                                parentbody2jnt_pos, parentbody2jnt_rpy)
+                    # Subsequent joints connect to previous dummy body
+                    # Position is relative to original child body position
+                    parentbody2jnt_pos = childbody2jnt_pos - cumulative_pos
+                    parentbody2jnt_rpy = np.zeros(3)
+                    parentbody2jnt_axis = jnt_axis_childbody
                 
-                # Update parent for next joint in chain
-                current_parent = jnt_body_name
-                cumulative_pos += childbody2jnt_pos
+                # Connect current parent to this joint body
+                create_joint(root, jnt_name, current_parent, jnt_body_name, 
+                            parentbody2jnt_pos, parentbody2jnt_rpy, 
+                            parentbody2jnt_axis, jnt_range)
+                
+            else:
+                # Handle other joint types (as fixed joints for now)
+                print(f"doesn't support joint type {model.jnt_type[jntid]}, treating as fixed joint...")
+                childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
+                if j == 0:
+                    parentbody2jnt_pos = parentbody2childbody_pos
+                    parentbody2jnt_rpy = parentbody2childbody_rpy
+                else:
+                    parentbody2jnt_pos = np.zeros(3)
+                    parentbody2jnt_rpy = np.zeros(3)
+                
+                create_joint(root, jnt_name, current_parent, jnt_body_name,
+                            parentbody2jnt_pos, parentbody2jnt_rpy)
             
-            # Connect last dummy body to child body with fixed joint
-            # "bring back" the body coordinates to the child body frame
-            jnt2childbody_pos = - childbody2jnt_pos if jntnum > 0 else np.zeros(3)
-            jnt2childbody_rpy = np.zeros(3)
-            create_joint(root, f"{jnt_name}_offset", current_parent, child_name,
-                         jnt2childbody_pos, jnt2childbody_rpy)
+            # Update parent for next joint in chain
+            current_parent = jnt_body_name
+            cumulative_pos += childbody2jnt_pos
+        
+        # Connect last dummy body to child body with fixed joint
+        # "bring back" the body coordinates to the child body frame
+        jnt2childbody_pos = - childbody2jnt_pos if jntnum > 0 else np.zeros(3)
+        jnt2childbody_rpy = np.zeros(3)
+        create_joint(root, f"{jnt_name}_offset", current_parent, child_name,
+                        jnt2childbody_pos, jnt2childbody_rpy)
+
+
+def object_to_urdf(model, object_name, robot_name=None, output_dir : Path=None, asset_file_prefix="") -> str:
+    root = ET.Element('robot', {'name': object_name if robot_name is None else robot_name})
+
+    root_id  = model.body_name2id(object_name)
+    bodies   = {root_id}
+    body_ids = np.arange(len(model.body_names))
+    while True:
+        connected = set(body_ids[np.isin(model.body_rootid, list(bodies))])
+        if len(connected - bodies) == 0: # Did not find new connected bodies
+            break
+        bodies |= connected
+
+    for on in np.asarray(model.body_names)[list(bodies)]:
+        convert_subtree(root, model, on, output_dir, asset_file_prefix)
+    return minidom.parseString(ET.tostring(root)).toprettyxml(indent="   ")
+
+
+def convert(mjcf_file, urdf_file, asset_file_prefix=""):
+    """
+    load MJCF file, parse it in mujoco and save it as URDF
+    replicate just the kinematic structure, ignore most dynamics, actuators, etc.
+    only works with mesh geoms
+    https://mujoco.readthedocs.io/en/stable/APIreference.html#mjmodel
+    http://wiki.ros.org/urdf/XML
+    
+    :param mjcf_file: path to existing MJCF file which will be loaded
+    :param urdf_file: path to URDF file which will be saved
+    :param asset_file_prefix: prefix to add to the stl file names (e.g. package://my_package/meshes/)
+    """
+    assert mjcf_file.endswith(".xml"), f"{mjcf_file=} should end with .xml"
+    assert urdf_file.endswith(".urdf"), f"{urdf_file=} should end with .urdf"
+    output_dir = os.path.dirname(urdf_file)
+    assert os.path.exists(output_dir), f"{output_dir=} does not exist, please create it first"
+    model = mujoco.MjModel.from_xml_path(mjcf_file)
+    root = ET.Element('robot', {'name': "converted_robot"})
+    root.append(ET.Comment('generated with mjcf_urdf_simple_converter (https://github.com/Yasu31/mjcf_urdf_simple_converter)'))
+
+    for id in range(model.nbody):
+        convert_subtree(root, model, id, output_dir, asset_file_prefix)
     
     # define white material
     material_element = ET.SubElement(root, 'material', {'name': 'white'})
@@ -234,6 +268,7 @@ def convert(mjcf_file, urdf_file, asset_file_prefix=""):
     xmlstr = minidom.parseString(ET.tostring(root)).toprettyxml(indent="   ")
     with open(urdf_file, "w") as f:
         f.write(xmlstr)
+
 
 if __name__ == '__main__':
     import argparse
