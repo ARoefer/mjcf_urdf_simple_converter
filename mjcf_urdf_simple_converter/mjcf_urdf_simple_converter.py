@@ -37,23 +37,20 @@ def create_dummy_body(xml_root, name):
     return create_body(xml_root, name, np.zeros(3), np.zeros(3), mass, mass_moi, mass_moi, mass_moi)
     
 
-def create_joint(xml_root, name, parent, child, pos, rpy, axis=None, jnt_range=None):
+def create_joint(xml_root, name, parent, child, pos, rpy, joint_type : str, axis=None, jnt_range=None):
     """
     if axis and jnt_range is None, create a fixed joint. otherwise, create a revolute joint
     """
-    if axis is None:
-        assert jnt_range is None
-        joint_type = 'fixed'
-    else:
-        joint_type = 'revolute'
     # create joint element connecting this to parent
     jnt_element = ET.SubElement(xml_root, 'joint', {'type': joint_type, 'name': name})
     ET.SubElement(jnt_element, 'parent', {'link': parent})
     ET.SubElement(jnt_element, 'child', {'link': child})
     ET.SubElement(jnt_element, 'origin', {'xyz': array2str(pos), 'rpy': array2str(rpy)})
-    if axis is not None:
-        ET.SubElement(jnt_element, 'axis', {'xyz': array2str(axis)})
-        ET.SubElement(jnt_element, 'limit', {'lower': str(jnt_range[0]), 'upper': str(jnt_range[1]), 'effort': "100", 'velocity': "100"})
+    if joint_type != 'fixed':
+        if axis is not None:
+            ET.SubElement(jnt_element, 'axis', {'xyz': array2str(axis)})
+        if jnt_range is not None:
+            ET.SubElement(jnt_element, 'limit', {'lower': str(jnt_range[0]), 'upper': str(jnt_range[1]), 'effort': "100", 'velocity': "100"})
     return jnt_element
 
 
@@ -146,11 +143,14 @@ def convert_subtree(root : ET.Element, model : mujoco.MjModel, id_or_name : Unio
         return  # skip adding joint element or parent body
 
     if jntnum == 0:
+        # We are not including the world frame in the URDF, so we can also not connect to it.
+        if parent_name == 'world':
+            return
         # No joints, create a fixed joint directly to parent
         jnt_name = f"{parent_name}2{child_name}_fixed"
         parentbody2jnt_pos = parentbody2childbody_pos
         parentbody2jnt_rpy = parentbody2childbody_rpy
-        create_joint(root, jnt_name, parent_name, child_name, parentbody2jnt_pos, parentbody2jnt_rpy)
+        create_joint(root, jnt_name, parent_name, child_name, parentbody2jnt_pos, parentbody2jnt_rpy, 'fixed')
     else:
         # For bodies with joints, create a chain of dummy bodies for each joint
         current_parent = parent_name
@@ -170,9 +170,11 @@ def convert_subtree(root : ET.Element, model : mujoco.MjModel, id_or_name : Unio
             # Create dummy body for this joint
             create_dummy_body(root, jnt_body_name)
             
-            if model.jnt_type[jntid] == mujoco.mjtJoint.mjJNT_HINGE:
+            is_limited = model.jnt_limited[jntid]
+            if model.jnt_type[jntid] in {mujoco.mjtJoint.mjJNT_HINGE, 
+                                         mujoco.mjtJoint.mjJNT_SLIDE}:
                 # Revolute joint
-                jnt_range = model.jnt_range[jntid]  # [min, max]
+                jnt_range = model.jnt_range[jntid] if is_limited else [-10000, 10000]  # [min, max]
                 jnt_axis_childbody = model.jnt_axis[jntid]  # [x, y, z]
                 childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
                 
@@ -191,12 +193,12 @@ def convert_subtree(root : ET.Element, model : mujoco.MjModel, id_or_name : Unio
                 
                 # Connect current parent to this joint body
                 create_joint(root, jnt_name, current_parent, jnt_body_name, 
-                            parentbody2jnt_pos, parentbody2jnt_rpy, 
+                            parentbody2jnt_pos, parentbody2jnt_rpy,
+                            'revolute' if model.jnt_type[jntid] == mujoco.mjtJoint.mjJNT_HINGE else 'prismatic',
                             parentbody2jnt_axis, jnt_range)
-                
             else:
                 # Handle other joint types (as fixed joints for now)
-                print(f"doesn't support joint type {model.jnt_type[jntid]}, treating as fixed joint...")
+                print(f"doesn't support joint type {model.jnt_type[jntid]} from {parent_name} to {child_name}, treating as fixed joint...")
                 childbody2jnt_pos = model.jnt_pos[jntid]  # [x, y, z]
                 if j == 0:
                     parentbody2jnt_pos = parentbody2childbody_pos
@@ -217,7 +219,7 @@ def convert_subtree(root : ET.Element, model : mujoco.MjModel, id_or_name : Unio
         jnt2childbody_pos = - childbody2jnt_pos if jntnum > 0 else np.zeros(3)
         jnt2childbody_rpy = np.zeros(3)
         create_joint(root, f"{jnt_name}_offset", current_parent, child_name,
-                        jnt2childbody_pos, jnt2childbody_rpy)
+                        jnt2childbody_pos, jnt2childbody_rpy, 'fixed')
 
 
 def object_to_urdf(model, object_name, robot_name=None, output_dir : Path=None, asset_file_prefix="") -> str:
